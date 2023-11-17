@@ -26,6 +26,7 @@ type Action struct {
 	DeleteUserRequest *v1.DeleteUserRequest
 	UpdateUserRequest *v1.UpdateUserRequest
 	ResetBMCRequest   *v1.ResetRequest
+	TerminateSOLRequest *v1.TerminateSOLRequest
 }
 
 // Option to add to an Actions.
@@ -67,6 +68,14 @@ func WithDeleteUserRequest(in *v1.DeleteUserRequest) Option {
 func WithUpdateUserRequest(in *v1.UpdateUserRequest) Option {
 	return func(a *Action) error {
 		a.UpdateUserRequest = in
+		return nil
+	}
+}
+
+// WithTerminateSOLRequest adds TerminateSOLRequest to an Action struct.
+func WithTerminateSOLRequest(in *v1.TerminateSOLRequest) Option {
+	return func(a *Action) error {
+		a.TerminateSOLRequest = in
 		return nil
 	}
 }
@@ -355,6 +364,66 @@ func (m Action) BMCReset(ctx context.Context, rType string) (err error) {
 	}
 	log.Info(fmt.Sprintf("%v reset complete", rLookup))
 	m.SendStatusMessage(fmt.Sprintf("%v bmc reset complete", rLookup))
+
+	return nil
+}
+
+// TerminateSOL functionality for machines.
+func (m Action) TerminateSOL(ctx context.Context) (err error) {
+	tracer := otel.Tracer("pbnj")
+	ctx, span := tracer.Start(ctx, "client.TerminateSOL")
+	defer span.End()
+
+	host, user, password, parseErr := m.ParseAuth(m.TerminateSOLRequest.Authn)
+	if parseErr != nil {
+		return parseErr
+	}
+	span.SetAttributes(attribute.String("bmc.host", host), attribute.String("bmc.username", user))
+	m.SendStatusMessage("working on SOL session termination")
+
+	opts := []bmclib.Option{
+		bmclib.WithLogger(m.Log),
+		bmclib.WithPerProviderTimeout(common.BMCTimeoutFromCtx(ctx)),
+		bmclib.WithIpmitoolPort("623"),
+	}
+
+	client := bmclib.NewClient(host, user, password, opts...)
+
+	err = client.Open(ctx)
+	if err != nil {
+		span.SetStatus(codes.Error, "Permission Denied: "+err.Error())
+		return &repository.Error{
+			Code:    v1.Code_value["PERMISSION_DENIED"],
+			Message: err.Error(),
+		}
+	}
+
+	log := m.Log.WithValues("host", host, "user", user)
+	defer func() {
+		client.Close(ctx)
+		log.Info("closed connections", logMetadata(client.GetMetadata())...)
+	}()
+	log.Info("connected to BMC", logMetadata(client.GetMetadata())...)
+	m.SendStatusMessage("connected to BMC")
+
+	ok, err := client.TerminateSOL(ctx)
+	log = m.Log.WithValues(logMetadata(client.GetMetadata())...)
+	if err != nil {
+		span.SetStatus(codes.Error, "failed to terminate SOL session: "+err.Error())
+		log.Error(err, "failed to terminate SOL session")
+	} else if !ok {
+		err = fmt.Errorf("SOL session termination failed")
+	}
+	if err != nil {
+		span.SetStatus(codes.Error, "failed to terminate SOL session: "+err.Error())
+		m.SendStatusMessage(fmt.Sprintf("failed to terminate SOL session"))
+		return &repository.Error{
+			Code:    v1.Code_value["UNKNOWN"],
+			Message: err.Error(),
+		}
+	}
+	log.Info(fmt.Sprintf("SOL termination complete"))
+	m.SendStatusMessage(fmt.Sprintf("SOL termination complete"))
 
 	return nil
 }
